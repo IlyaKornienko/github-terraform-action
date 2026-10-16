@@ -1,0 +1,70 @@
+name: Basic checks
+on:
+  push:
+    branches:
+      - '*'
+      - '!main'
+
+jobs:
+  lint:
+    environment: terraform-plan
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+        - name: Get code
+          uses: actions/checkout@v7
+        # add cache ficherse
+        - name: Setup Terraform
+          uses: hashicorp/setup-terraform@v4
+          with:
+            terraform_version: 1.12.2
+                  
+        - name: Terraform fmt
+          id: fmt
+          run: terraform fmt -check
+          continue-on-error: true
+
+        - name: Terraform Init
+          env:
+            ARM_USE_AZUREAD: "true"
+            ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+            ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+            ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+            RESOURCE_GROUP: ${{ secrets.RESOURCE_GROUP }}
+            STORAGE_ACCOUNT: ${{ secrets.STORAGE_ACCOUNT }}
+            CONTAINER_NAME: ${{ secrets.CONTAINER_NAME }}
+          run: |
+            terraform init \
+              -backend-config="resource_group_name=$RESOURCE_GROUP" \
+              -backend-config="storage_account_name=$STORAGE_ACCOUNT" \
+              -backend-config="container_name=$CONTAINER_NAME"
+
+        - name: Terraform Validate
+          id: validate
+          run: terraform validate -no-color
+        
+        - name: Upload validate report
+          if: failure() && steps.validate.outcome == 'failure'
+          uses: actions/upload-artifact@v7
+          with:
+            name: validate-report
+            path: validate.txt
+          
+        - name: Terraform Plan
+          id: plan
+          env:
+            ARM_USE_AZUREAD: "true"
+          run: terraform plan -out=tfplan
+
+        - name: Upload artifacts
+          uses: actions/upload-artifact@v7
+          with:
+            name: terraform-plan-${{ github.workflow }}-${{ github.job }}-${{ github.run_id }}
+            path: terraform-plan
+          
