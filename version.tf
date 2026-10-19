@@ -1,7 +1,5 @@
 terraform {
-  backend "azurerm" {
-    key = "terraform.tfstate"
-  }
+  backend "azurerm" {}
   required_providers {
     azurerm = {
       source  = "Hashicorp/azurerm"
