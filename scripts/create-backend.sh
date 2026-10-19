@@ -14,12 +14,18 @@
 #       * Contributor on the subscription (so Terraform can manage resources)
 #
 # Usage:
-#   GITHUB_REPO=owner/repo ./scripts/create-tf-backend.sh
+#   GITHUB_REPO=owner/repo ./scripts/create-backend.sh
 #
 # Override defaults via environment variables, e.g.:
 #   RESOURCE_GROUP=my-tfstate-rg LOCATION=westus2 \
-#   GITHUB_REPO=myorg/myrepo GITHUB_ENVIRONMENT=terraform-plan \
-#   ./scripts/create-tf-backend.sh
+#   GITHUB_REPO=myorg/myrepo \
+#   ./scripts/create-backend.sh
+#
+# OIDC subjects use GitHub immutable format (owner/repo IDs resolved via API):
+#   repo:OWNER@OWNER_ID/REPO@REPO_ID:environment:ENV_NAME
+#
+# Optional overrides (skip API lookup):
+#   GITHUB_OWNER_ID=95024215 GITHUB_REPO_ID=1422412533
 
 set -euo pipefail
 
@@ -34,9 +40,57 @@ SKU="${SKU:-Standard_LRS}"
 # Managed identity / GitHub OIDC config
 UAMI_NAME="${UAMI_NAME:-tfstate-github-uami}"
 GITHUB_REPO="${GITHUB_REPO:-}"                       # e.g. "owner/repo" (REQUIRED)
+GITHUB_OWNER_ID="${GITHUB_OWNER_ID:-}"               # optional; resolved from API if empty
+GITHUB_REPO_ID="${GITHUB_REPO_ID:-}"                 # optional; resolved from API if empty
 PLAN_ENVIRONMENT="${PLAN_ENVIRONMENT:-terraform-plan}"
 APPLY_ENVIRONMENT="${APPLY_ENVIRONMENT:-terraform-apply}"
 SUBSCRIPTION_ROLE="${SUBSCRIPTION_ROLE:-Contributor}"
+
+# ----- Helpers ----------------------------------------------------------------
+resolve_github_ids() {
+  local owner="$1" repo_name="$2"
+
+  if [[ -n "${GITHUB_OWNER_ID}" && -n "${GITHUB_REPO_ID}" ]]; then
+    echo "==> Using provided GitHub IDs (owner=${GITHUB_OWNER_ID}, repo=${GITHUB_REPO_ID})"
+    return 0
+  fi
+
+  if [[ -n "${GITHUB_OWNER_ID}" || -n "${GITHUB_REPO_ID}" ]]; then
+    echo "ERROR: set both GITHUB_OWNER_ID and GITHUB_REPO_ID, or neither." >&2
+    exit 1
+  fi
+
+  echo "==> Resolving GitHub owner/repo IDs for ${owner}/${repo_name}..."
+
+  if command -v gh >/dev/null 2>&1; then
+    GITHUB_REPO_ID="$(gh api "repos/${owner}/${repo_name}" --jq .id)"
+    GITHUB_OWNER_ID="$(gh api "repos/${owner}/${repo_name}" --jq .owner.id)"
+  elif command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    local api_url="https://api.github.com/repos/${owner}/${repo_name}"
+    local auth_header=()
+    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+      auth_header=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+    fi
+    local payload
+    payload="$(curl -fsSL \
+      -H "Accept: application/vnd.github+json" \
+      -H "X-GitHub-Api-Version: 2022-11-28" \
+      "${auth_header[@]}" \
+      "${api_url}")"
+    GITHUB_REPO_ID="$(jq -r .id <<<"${payload}")"
+    GITHUB_OWNER_ID="$(jq -r .owner.id <<<"${payload}")"
+  else
+    echo "ERROR: cannot resolve GitHub IDs. Install 'gh' (preferred) or curl+jq," >&2
+    echo "       or pass GITHUB_OWNER_ID and GITHUB_REPO_ID explicitly." >&2
+    exit 1
+  fi
+
+  if [[ -z "${GITHUB_OWNER_ID}" || -z "${GITHUB_REPO_ID}" || \
+        "${GITHUB_OWNER_ID}" == "null" || "${GITHUB_REPO_ID}" == "null" ]]; then
+    echo "ERROR: failed to resolve GitHub IDs for ${owner}/${repo_name}." >&2
+    exit 1
+  fi
+}
 
 # ----- Preflight --------------------------------------------------------------
 if ! command -v az >/dev/null 2>&1; then
@@ -54,11 +108,23 @@ if [[ -z "${GITHUB_REPO}" ]]; then
   exit 1
 fi
 
+if [[ ! "${GITHUB_REPO}" =~ ^[^/]+/[^/]+$ ]]; then
+  echo "ERROR: GITHUB_REPO must be in 'owner/repo' form (got '${GITHUB_REPO}')." >&2
+  exit 1
+fi
+
+GITHUB_OWNER="${GITHUB_REPO%%/*}"
+GITHUB_REPO_NAME="${GITHUB_REPO##*/}"
+
+resolve_github_ids "${GITHUB_OWNER}" "${GITHUB_REPO_NAME}"
+
 SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
 TENANT_ID="$(az account show --query tenantId -o tsv)"
 
-PLAN_SUBJECT="repo:${GITHUB_REPO}:environment:${PLAN_ENVIRONMENT}"
-APPLY_SUBJECT="repo:${GITHUB_REPO}:environment:${APPLY_ENVIRONMENT}"
+# Immutable OIDC subject: repo:OWNER@OWNER_ID/REPO@REPO_ID:environment:ENV
+REPO_SUBJECT_PREFIX="repo:${GITHUB_OWNER}@${GITHUB_OWNER_ID}/${GITHUB_REPO_NAME}@${GITHUB_REPO_ID}"
+PLAN_SUBJECT="${REPO_SUBJECT_PREFIX}:environment:${PLAN_ENVIRONMENT}"
+APPLY_SUBJECT="${REPO_SUBJECT_PREFIX}:environment:${APPLY_ENVIRONMENT}"
 
 echo "Subscription : $(az account show --query name -o tsv) (${SUBSCRIPTION_ID})"
 echo "Tenant       : ${TENANT_ID}"
@@ -67,6 +133,7 @@ echo "Location     : ${LOCATION}"
 echo "Storage acct : ${STORAGE_ACCOUNT}"
 echo "Container    : ${CONTAINER_NAME}"
 echo "UAMI         : ${UAMI_NAME}"
+echo "GitHub repo  : ${GITHUB_OWNER}@${GITHUB_OWNER_ID}/${GITHUB_REPO_NAME}@${GITHUB_REPO_ID}"
 echo "OIDC subjects:"
 echo "  - ${PLAN_SUBJECT}"
 echo "  - ${APPLY_SUBJECT}"
